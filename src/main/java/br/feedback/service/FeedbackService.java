@@ -4,8 +4,8 @@ import br.feedback.domain.Feedback;
 import br.feedback.dto.FeedbackPayload;
 import br.feedback.entity.FeedbackEntity;
 import br.feedback.repository.FeedbackRepository;
+import br.feedback.repository.FeedbackRepositoryImpl;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.smallrye.mutiny.Multi;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -16,7 +16,7 @@ import java.util.UUID;
 public class FeedbackService {
 
     @Inject
-    FeedbackRepository repository;
+    FeedbackRepositoryImpl repository;
     
     @Inject
     SqsService sqsService;
@@ -47,12 +47,5 @@ public class FeedbackService {
         FeedbackEntity entity = FeedbackEntity.fromDomain(feedback);
         repository.persist(entity);
     }
-    
-    public Multi<FeedbackEntity> listarTodos() {
-        return repository.listAll();
-    }
-    
-    public void limparDados() {
-        repository.deleteAll();
-    }
+
 }
