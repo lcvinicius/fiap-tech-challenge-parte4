@@ -1,0 +1,672 @@
+name: Deploy or Destroy AWS Infra (VPC + RDS + Lambda + API Gateway)
+
+on:
+  push:
+    branches:
+      - develop
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    env:
+      TF_ACTION: destroy  # apply | destroy
+      AWS_REGION: us-east-1
+      LAMBDA_RESOURCE_NAME: items
+      LAMBDA_FUNCTION_NAME: items-api-lambda
+      VPC_RESOURCE_NAME: this_vpc
+      API_NAME: items-http-api
+      API_RESOURCE_NAME: http_api
+      RDS_SG_RESOURCE_NAME: rds_sg
+      DB_INSTANCE_IDENTIFIER: items-db
+      RDS_DB_RESOURCE_NAME: items_db
+
+    steps:
+      # Iniciando e configurando
+      - name: Checkout código
+        uses: actions/checkout@v3
+
+      - name: Autenticar com AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::757367947438:role/GitHubOIDCRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verificar modo de operação
+        run: echo "Iniciando workflow em modo $TF_ACTION"
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform Init
+        working-directory: infra
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: infra
+        run: terraform validate
+
+      - name: Terraform Plan (refresh)
+        working-directory: infra
+        run: |
+          echo "🔄 Sincronizando estado com AWS..."
+          terraform plan
+
+      # Verificar existência da IAM Role
+      - name: Verificar IAM Role pelo Name
+        id: get_iam_role
+        run: |
+          ROLE_NAME="lambda-java-items-api-role"
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "✅ IAM Role encontrada: $ROLE_NAME"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "IAM_ROLE_NAME=$ROLE_NAME" >> $GITHUB_ENV
+          else
+            echo "⚠️ IAM Role não encontrada"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Importar IAM Role se existir
+      - name: Importar IAM Role se existir
+        working-directory: infra
+        run: |
+          if [ -n "$IAM_ROLE_NAME" ]; then
+          echo "Importando IAM Role para o Terraform state..."
+          terraform import aws_iam_role.lambda_exec_role "$IAM_ROLE_NAME" || true
+          else
+          echo "IAM_ROLE_NAME não definido, pulando import."
+          fi
+
+      # Verificar se a policy custom existe
+      - name: Verificar se a policy custom SQS existe
+        id: check_custom_policy
+        working-directory: infra
+        env:
+          CUSTOM_POLICY_NAME: lambda-sqs-policy
+        run: |
+          echo "Verificando existência da policy '${CUSTOM_POLICY_NAME}'..."
+          
+          POLICY_ARN=$(aws iam list-policies \
+            --scope Local \
+            --query "Policies[?PolicyName=='${CUSTOM_POLICY_NAME}'].Arn | [0]" \
+            --output text)
+          
+          if [ -n "$POLICY_ARN" ] && [ "$POLICY_ARN" != "None" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "policy_arn=$POLICY_ARN" >> $GITHUB_OUTPUT
+            echo "✅ Policy custom existe: $POLICY_ARN"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Policy custom não existe"
+          fi
+
+      # Importar policy custom (somente se existir)
+      - name: Importar policy custom SQS
+        if: steps.check_custom_policy.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          POLICY_ARN="${{ steps.check_custom_policy.outputs.policy_arn }}"
+          
+          echo "Importando policy custom para o Terraform state..."
+          terraform import aws_iam_policy.lambda_sqs_policy "$POLICY_ARN" || true
+
+      # Importar attachment da policy custom (somente se policy existir)
+      - name: Importar policy attachment custom SQS (se estiver anexada)
+        if: steps.check_custom_policy.outputs.exists == 'true'
+        working-directory: infra
+        env:
+          CUSTOM_POLICY_NAME: lambda-sqs-policy
+        run: |
+          POLICY_ARN=$(aws iam list-attached-role-policies \
+          --role-name "$IAM_ROLE_NAME" \
+          --query "AttachedPolicies[?PolicyName=='${CUSTOM_POLICY_NAME}'].PolicyArn" \
+          --output text)
+          
+          if [ -n "$POLICY_ARN" ] && [ "$POLICY_ARN" != "None" ]; then
+          echo "Policy custom está anexada, importando attachment..."
+          terraform import aws_iam_role_policy_attachment.lambda_sqs_attach ${IAM_ROLE_NAME}/${POLICY_ARN}
+          else
+          echo "Policy custom existe mas não está anexada, pulando import"
+          fi
+
+      # Verificar existencia de VPC e importar
+      - name: Verificar e Obter VPC pelo Name
+        id: get_vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=app-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text 2>/dev/null || true)
+          
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "❌ VPC não encontrada"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ VPC encontrada: $VPC_ID"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+          fi
+
+      # Importar VPC para o state
+      - name: Importar VPC para o state (se necessário)
+        if: steps.get_vpc.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          if terraform state show aws_vpc.${VPC_RESOURCE_NAME} >/dev/null 2>&1; then
+            echo "ℹ️ VPC já está no state do Terraform"
+          else
+            echo "📥 Importando VPC para o state..."
+            terraform import aws_vpc.${VPC_RESOURCE_NAME} ${VPC_ID}
+          fi
+
+      # Verificar existencia de Subnets e importar
+      - name: Importar Subnets privadas se existirem
+        if: steps.get_vpc.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          # Subnet private_a
+          PRIVATE_A_ID=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=private-a" \
+            --query "Subnets[0].SubnetId" \
+            --output text)
+          
+          if [ -n "$PRIVATE_A_ID" ] && [ "$PRIVATE_A_ID" != "None" ]; then
+            echo "Importando Subnet private_a: $PRIVATE_A_ID"
+            terraform import aws_subnet.private_a $PRIVATE_A_ID || echo "Subnet private_a já importada"
+          else
+            echo "Subnet private_a não encontrada, pulando import"
+          fi
+          
+          # Subnet private_b
+          PRIVATE_B_ID=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=private-b" \
+            --query "Subnets[0].SubnetId" \
+            --output text)
+          
+          if [ -n "$PRIVATE_B_ID" ] && [ "$PRIVATE_B_ID" != "None" ]; then
+            echo "Importando Subnet private_b: $PRIVATE_B_ID"
+            terraform import aws_subnet.private_b $PRIVATE_B_ID || echo "Subnet private_b já importada"
+          else
+            echo "Subnet private_b não encontrada, pulando import"
+          fi
+
+      # Verificar existencia de API Gateway e importar
+      - name: Verificar e Obter API Gateway pelo Name
+        id: get_api
+        run: |
+          API_ID=$(aws apigatewayv2 get-apis --region $AWS_REGION \
+            --query "Items[?Name=='$API_NAME'].ApiId | [0]" \
+            --output text)
+          
+          if [ -z "$API_ID" ] || [ "$API_ID" = "None" ]; then
+            echo "API Gateway não encontrada"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            # Verifica se a API realmente existe
+            if aws apigatewayv2 get-api --api-id $API_ID >/dev/null 2>&1; then
+              echo "✅ API Gateway encontrada: $API_ID"
+              echo "exists=true" >> $GITHUB_OUTPUT
+              echo "API_ID=$API_ID" >> $GITHUB_ENV
+            else
+              echo "⚠️ API Gateway não encontrada (ID obtido, mas não existe mais)"
+              echo "exists=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      # Importar API Gateway se existir
+      - name: Importar API Gateway se existir
+        if: env.TF_ACTION == 'destroy' && steps.get_api.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          echo "Importando API Gateway para o estado..."
+          terraform import aws_apigatewayv2_api.${API_RESOURCE_NAME} ${API_ID}
+
+      # Verificar existencia de RDS e importar
+      - name: Verificar e Obter RDS Instance pelo identifier
+        id: get_rds
+        run: |
+          DB_ID="${DB_INSTANCE_IDENTIFIER}"
+          
+          if aws rds describe-db-instances \
+            --db-instance-identifier "$DB_ID" >/dev/null 2>&1; then
+            echo "RDS encontrada: $DB_ID"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "DB_INSTANCE_ID=$DB_ID" >> $GITHUB_ENV
+          else
+            echo "RDS não encontrada"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Importar RDS Instance
+      - name: Importar RDS Instance
+        if: env.TF_ACTION == 'destroy' && steps.get_rds.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          terraform import aws_db_instance.${RDS_DB_RESOURCE_NAME} ${DB_INSTANCE_ID}
+
+      # Verificar existencia de DB Subnet Group
+      - name: Verificar e Obter DB Subnet Group
+        id: get_db_subnet_group
+        run: |
+          set -x
+          SUBNET_GROUP_NAME="app-db-subnet-group"
+          echo "Verificando Subnet Group: $SUBNET_GROUP_NAME"
+          
+          EXISTS=$(aws rds describe-db-subnet-groups \
+            --db-subnet-group-name $SUBNET_GROUP_NAME \
+            --query "DBSubnetGroups[0].DBSubnetGroupName" \
+            --output text || echo "")
+          
+          echo "Valor retornado pelo AWS CLI: '$EXISTS'"
+          
+          if [ -n "$EXISTS" ] && [ "$EXISTS" != "None" ]; then
+            echo "DB Subnet Group encontrado: $SUBNET_GROUP_NAME"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "DB_SUBNET_GROUP_NAME=$SUBNET_GROUP_NAME" >> $GITHUB_ENV
+          else
+            echo "DB Subnet Group NÃO encontrado"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Importar DB Subnet Group se existir
+      - name: Importar DB Subnet Group se existir
+        if: steps.get_db_subnet_group.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          echo "Importando DB Subnet Group para o Terraform state..."
+          terraform import aws_db_subnet_group.this_subnet_group $DB_SUBNET_GROUP_NAME || true
+
+      # Verificar e importar Security Group do Endpoint SQS
+      - name: Verificar Security Group do Endpoint SQS
+        id: check_sqs_endpoint_sg
+        run: |
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=sqs-endpoint-sg" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text)
+          
+          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+            echo "Security Group do Endpoint SQS não encontrado"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "Security Group do Endpoint SQS encontrado: $SG_ID"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "SQS_ENDPOINT_SG_ID=$SG_ID" >> $GITHUB_ENV
+          fi
+
+      # Importar Security Group do Endpoint SQS
+      - name: Importar Security Group do Endpoint SQS
+        if: env.TF_ACTION == 'destroy' && steps.check_sqs_endpoint_sg.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          echo "Importando Security Group do Endpoint SQS: ${SQS_ENDPOINT_SG_ID}"
+          terraform import aws_security_group.endpoint_sg ${SQS_ENDPOINT_SG_ID}
+
+      # Verificar existência do VPC Endpoint SQS
+      - name: Verificar existência do VPC Endpoint SQS
+        id: check_sqs_endpoint
+        run: |
+          if [ -z "$VPC_ID" ]; then
+            echo "⚠️ VPC_ID não definido, pulando verificação"
+            echo "endpoint_exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Verificando existência do Endpoint SQS na VPC $VPC_ID..."
+          
+          ENDPOINT_ID=$(aws ec2 describe-vpc-endpoints \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=com.amazonaws.${AWS_REGION}.sqs" \
+            --query "VpcEndpoints[?VpcEndpointType=='Interface'].VpcEndpointId | [0]" \
+            --output text)
+          
+          if [ -n "$ENDPOINT_ID" ] && [ "$ENDPOINT_ID" != "None" ]; then
+            echo "✅ Endpoint SQS encontrado: $ENDPOINT_ID"
+            echo "endpoint_exists=true" >> $GITHUB_OUTPUT
+            echo "endpoint_id=$ENDPOINT_ID" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Endpoint SQS não encontrado"
+            echo "endpoint_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Importar VPC Endpoint SQS no Terraform
+      - name: Importar VPC Endpoint SQS
+        if: steps.check_sqs_endpoint.outputs.endpoint_exists == 'true'
+        working-directory: infra
+        run: |
+          ENDPOINT_ID="${{ steps.check_sqs_endpoint.outputs.endpoint_id }}"
+          echo "Importando Endpoint SQS no Terraform..."
+          terraform import aws_vpc_endpoint.sqs "$ENDPOINT_ID" || echo "Endpoint já importado ou não existe"
+
+      # Verficar VPC Endpoint SNS no Terraform
+      - name: Verificar existência do VPC Endpoint SNS
+        id: check_sns_endpoint
+        run: |
+          if [ -z "$VPC_ID" ]; then
+            echo "⚠️ VPC_ID não definido, pulando verificação"
+            echo "endpoint_exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Verificando existência do Endpoint SNS na VPC $VPC_ID..."
+          
+          ENDPOINT_ID=$(aws ec2 describe-vpc-endpoints \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=com.amazonaws.${AWS_REGION}.sns" \
+            --query "VpcEndpoints[?VpcEndpointType=='Interface'].VpcEndpointId | [0]" \
+            --output text)
+          
+          if [ -n "$ENDPOINT_ID" ] && [ "$ENDPOINT_ID" != "None" ]; then
+            echo "✅ Endpoint SNS encontrado: $ENDPOINT_ID"
+            echo "endpoint_exists=true" >> $GITHUB_OUTPUT
+            echo "endpoint_id=$ENDPOINT_ID" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Endpoint SNS não encontrado"
+            echo "endpoint_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Importar VPC Endpoint SNS no Terraform
+      - name: Importar VPC Endpoint SNS
+        if: steps.check_sns_endpoint.outputs.endpoint_exists == 'true'
+        working-directory: infra
+        run: |
+          ENDPOINT_ID="${{ steps.check_sns_endpoint.outputs.endpoint_id }}"
+          echo "Importando Endpoint SNS no Terraform..."
+          terraform import aws_vpc_endpoint.sns "$ENDPOINT_ID" || echo "Endpoint já importado ou não existe"
+
+      # Verificar existencia de Security Group do RDS
+      - name: Verificar e Obter Security Group do RDS
+        id: get_rds_sg
+        run: |
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=rds-sg" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text)
+          
+          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+            echo "Security Group do RDS não encontrado"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Security Group encontrado: $SG_ID"
+          echo "exists=true" >> $GITHUB_OUTPUT
+          echo "RDS_SG_ID=$SG_ID" >> $GITHUB_ENV
+
+      # Importar Security Group do RDS
+      - name: Importar Security Group do RDS
+        if: env.TF_ACTION == 'destroy' && steps.get_rds_sg.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          terraform import aws_security_group.${RDS_SG_RESOURCE_NAME} ${RDS_SG_ID}
+
+      # Verificar existencia de Lambda
+      - name: Verificar existência de Lambda
+        id: lambda_check
+        run: |
+          if aws lambda get-function --function-name $LAMBDA_FUNCTION_NAME; then
+            echo "✅ Lambda encontrada: $LAMBDA_FUNCTION_NAME"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Lambda não encontrada."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Importar Lambda se existir
+      - name: Importar Lambda se existir
+        if: env.TF_ACTION == 'destroy' && steps.lambda_check.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          echo "Importando Lambda para o estado..."
+          terraform import aws_lambda_function.${LAMBDA_RESOURCE_NAME} ${LAMBDA_FUNCTION_NAME}
+
+      # Importar Security Group da Lambda
+      - name: Importar Security Group da Lambda
+        if: env.TF_ACTION == 'destroy' && steps.get_vpc.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          # Pega o ID do Security Group da Lambda
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=lambda-sg" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text)
+          
+          if [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ]; then
+            echo "Importando Security Group da Lambda: $SG_ID"
+            terraform import aws_security_group.lambda_sg $SG_ID
+          else
+            echo "Security Group da Lambda não encontrado, pulando import"
+          fi
+
+      #### Criação das infras na ordem correta
+
+      # APPLY - Executar da VPC
+      - name: APPLY - Executar da VPC
+        if: env.TF_ACTION == 'apply' && steps.get_vpc.outputs.exists == 'false'
+        working-directory: infra
+        run: |
+          echo "Criando VPC..."
+          terraform apply -target=aws_vpc.${VPC_RESOURCE_NAME} -auto-approve
+
+      # APPLY - Endpoint SQS e Security Group
+      - name: APPLY - Endpoint SQS e Security Group
+        if: env.TF_ACTION == 'apply' && steps.check_sqs_endpoint_sg.outputs.exists == 'false'
+        working-directory: infra
+        run: |
+          echo "Criando Security Group do Endpoint SQS..."
+          terraform apply \
+            -target=aws_security_group.endpoint_sg \
+            -auto-approve
+          
+          echo "Criando Endpoint SQS..."
+          terraform apply \
+            -target=aws_vpc_endpoint.sqs \
+            -auto-approve
+
+      # APPLY - Endpoint SNS
+      - name: APPLY - Endpoint SNS
+        if: env.TF_ACTION == 'apply'
+        working-directory: infra
+        run: |
+          echo "Criando Endpoint SNS..."
+          terraform apply \
+            -target=aws_vpc_endpoint.sns \
+            -auto-approve
+
+      # APPLY - RDS e Security Group
+      - name: APPLY - RDS e Security Group
+        if: env.TF_ACTION == 'apply' && steps.get_rds.outputs.exists == 'false'
+        working-directory: infra
+        run: |
+          terraform apply \
+            -target=aws_security_group.${RDS_SG_RESOURCE_NAME} \
+            -target=aws_db_instance.${RDS_DB_RESOURCE_NAME} \
+            -auto-approve
+
+      # APPLY - Custom IAM Policy
+      - name: APPLY - Custom IAM Policy
+        if: env.TF_ACTION == 'apply' && steps.get_policy_custom.outputs.exists == 'false'
+        working-directory: infra
+        run: |
+          echo "Criando policy customizada lambda-sqs-policy..."
+          terraform apply -target=aws_iam_policy.lambda_sqs_policy -auto-approve
+
+      # APPLY - IAM Role
+      - name: APPLY - IAM Role
+        if: env.TF_ACTION == 'apply'
+        working-directory: infra
+        run: |
+          echo "Criando IAM Role..."
+          terraform apply -target=aws_iam_role.lambda_exec_role -auto-approve
+
+      # APPLY - IAM policy attachments
+      - name: APPLY - IAM policy attachments
+        if: env.TF_ACTION == 'apply'
+        working-directory: infra
+        run: |
+          terraform apply \
+            -target=aws_iam_role_policy_attachment.lambda_basic_exec \
+            -target=aws_iam_role_policy_attachment.lambda_vpc_access \
+            -target=aws_iam_role_policy_attachment.lambda_sqs_attach \
+            -auto-approve
+
+      - name: Instalar Java e compilar (modo apply)
+        if: env.TF_ACTION == 'apply'
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Compilar Lambda com Maven
+        if: env.TF_ACTION == 'apply'
+        working-directory: lambda
+        run: mvn clean package -U -DskipTests
+
+      - name: Copiar JAR gerado para a pasta de deploy
+        if: env.TF_ACTION == 'apply'
+        run: |
+          mkdir -p infra/build/lambda
+          cp lambda/target/function.zip infra/build/lambda/function.zip
+
+      # APPLY - Executar da Lambda
+      - name: APPLY - Executar da Lambda
+        if: env.TF_ACTION == 'apply' && steps.lambda_check.outputs.exists == 'false'
+        working-directory: infra
+        run: |
+          echo "Criando Lambda..."
+          terraform apply -target=aws_lambda_function.${LAMBDA_RESOURCE_NAME} -auto-approve
+
+      # APPLY - API Gateway (completo)
+      - name: APPLY - API Gateway (completo)
+        if: env.TF_ACTION == 'apply' && steps.get_api.outputs.exists == 'false'
+        working-directory: infra
+        run: |
+          echo "Criando API..."
+          terraform apply \
+            -target=aws_apigatewayv2_api.${API_RESOURCE_NAME} \
+            -auto-approve
+          
+          echo "Criando integração com Lambda..."
+          terraform apply \
+            -target=aws_apigatewayv2_integration.${LAMBDA_RESOURCE_NAME} \
+            -auto-approve
+          
+          echo "Criando rotas..."
+          terraform apply \
+            -target=aws_apigatewayv2_route.post_items \
+            -auto-approve
+          
+          echo "Criando stage..."
+          terraform apply \
+            -target=aws_apigatewayv2_stage.default \
+            -auto-approve
+          
+          echo "Criando permissão da Lambda para API Gateway..."
+          terraform apply \
+            -target=aws_lambda_permission.allow_api_gateway \
+            -auto-approve
+
+
+      #### Destruição das infras na ordem correta
+
+      # Destroy attachments
+      - name: DESTROY - IAM policy attachments
+        if: env.TF_ACTION == 'destroy' && steps.get_iam_role.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          terraform destroy \
+            -target=aws_iam_role_policy_attachment.lambda_basic_exec \
+            -target=aws_iam_role_policy_attachment.lambda_vpc_access \
+            -target=aws_iam_role_policy_attachment.lambda_sqs_attach \
+            -auto-approve
+
+      # Destroy IAM Role
+      - name: DESTROY - IAM Role
+        if: env.TF_ACTION == 'destroy' && steps.get_iam_role.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          echo "Destruindo IAM Role..."
+          terraform destroy -target=aws_iam_role.lambda_exec_role -auto-approve
+
+      # Destroy custom IAM Policy
+      - name: DESTROY - Custom IAM Policy
+        if: env.TF_ACTION == 'destroy'
+        working-directory: infra
+        run: |
+          echo "Destruindo policy customizada lambda-sqs-policy..."
+          terraform destroy -target=aws_iam_policy.lambda_sqs_policy -auto-approve
+
+      # Destroy Lambda
+      - name: DESTROY - Lambda
+        if: env.TF_ACTION == 'destroy' && steps.lambda_check.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          echo "Destruindo Lambda..."
+          terraform destroy -target=aws_lambda_function.${LAMBDA_RESOURCE_NAME} -auto-approve
+
+      # Destroy API Gateway (completo)
+      - name: DESTROY - API Gateway (completo)
+        if: env.TF_ACTION == 'destroy' && steps.get_api.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          echo "Destruindo API..."
+          terraform destroy -target=aws_apigatewayv2_api.${API_RESOURCE_NAME} -auto-approve
+
+      # Destroy RDS Instance
+      - name: DESTROY - RDS Instance
+        if: env.TF_ACTION == 'destroy' && steps.get_rds.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          terraform destroy -target=aws_db_instance.${RDS_DB_RESOURCE_NAME} -auto-approve
+
+      # Destroy DB Subnet Group
+      - name: DESTROY - DB Subnet Group
+        if: env.TF_ACTION == 'destroy' && steps.get_db_subnet_group.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          terraform destroy -target=aws_db_subnet_group.this_subnet_group -auto-approve
+
+      # Destroy Endpoint SNS
+      - name: DESTROY - Endpoint SNS
+        if: env.TF_ACTION == 'destroy' && steps.check_sns_endpoint.outputs.endpoint_exists == 'true'
+        working-directory: infra
+        run: |
+          terraform destroy -target=aws_vpc_endpoint.sns -auto-approve
+
+      # Destroy Endpoint SQS
+      - name: DESTROY - Endpoint SQS
+        if: env.TF_ACTION == 'destroy' && steps.check_sqs_endpoint_sg.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          terraform destroy -target=aws_vpc_endpoint.sqs -auto-approve
+
+      # Destroy Security Group do Endpoint SQS
+      - name: DESTROY - Security Group do Endpoint SQS
+        if: env.TF_ACTION == 'destroy' && steps.check_sqs_endpoint_sg.outputs.exists == 'true'
+        working-directory: infra
+        run: |
+          terraform destroy -target=aws_security_group.endpoint_sg -auto-approve
+
+#      - name: DESTROY - Security Groups da VPC
+#        if: env.TF_ACTION == 'destroy' && steps.get_vpc.outputs.exists == 'true'
+#        working-directory: infra
+#        run: |
+#          terraform destroy -target=aws_security_group.lambda_sg -auto-approve
+#          terraform destroy -target=aws_security_group.${RDS_SG_RESOURCE_NAME} -auto-approve
+#
+#      - name: DESTROY - Subnets da VPC
+#        if: env.TF_ACTION == 'destroy' && steps.get_vpc.outputs.exists == 'true'
+#        working-directory: infra
+#        run: |
+#          terraform destroy -target=aws_subnet.private_a -auto-approve
+#          terraform destroy -target=aws_subnet.private_b -auto-approve
+#
+#      - name: DESTROY - VPC
+#        if: env.TF_ACTION == 'destroy' && steps.get_vpc.outputs.exists == 'true'
+#        working-directory: infra
+#        run: |
+#          terraform destroy -target=aws_vpc.this_vpc -auto-approve
